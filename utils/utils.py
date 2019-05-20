@@ -222,47 +222,89 @@ def bbox_iou(box1, box2, x1y1x2y2=True):
 
     return iou
 
+# nms: 对于每一类(不同类之间的box不执行nms), 先选出具有最大score的box, 删除与该box交并比较大的同类box,
+# 接着继续选下一个最大socre的box, 直至同类box为空, 然后对下一类执行nms
+# 注意yolo与faster rcnn在执行nms算法时的不同, 前者是在多类上执行的, 后者是在两类上执行的
+def non_max_suppression(prediction, num_classes, conf_thres=0.5, nms_thres=0.4):
+    # prediction的shape为: [1,10647,85], 其中, 1为batch_size, 10647是尺寸为416的图片的anchor box的总数
+    # num_classes: 80
+    # 移除那些置信度低于conf_thres的boxes, 同时在剩余的boxes上执行NMS算法
+    # 返回值中box的shape为: (x1, y1, x2, y2, object_conf, class_score, class_pred)
 
-def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
-    """
-    Removes detections with lower object confidence score than 'conf_thres' and performs
-    Non-Maximum Suppression to further filter detections.
-    Returns detections with shape:
-        (x1, y1, x2, y2, object_conf, class_score, class_pred)
-    """
+    # 获取box的(x1,x2,y1,y2)坐标
+    box_corner = prediction.new(prediction.shape)
+    box_corner[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
+    box_corner[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
+    box_corner[:, :, 2] = prediction[:, :, 0] + prediction[:, :, 2] / 2
+    box_corner[:, :, 3] = prediction[:, :, 1] + prediction[:, :, 3] / 2
+    prediction[:, :, :4] = box_corner[:, :, :4]
 
-    # From (center x, center y, width, height) to (x1, y1, x2, y2)
-    prediction[..., :4] = xywh2xyxy(prediction[..., :4])
+    # len(prediction)为Batch_size, 这里申请了占位空间, 大小为batch_size
     output = [None for _ in range(len(prediction))]
     for image_i, image_pred in enumerate(prediction):
-        # Filter out confidence scores below threshold
-        image_pred = image_pred[image_pred[:, 4] >= conf_thres]
-        # If none are remaining => process next image
+        # 先清除所有置信度小于conf_thres的box, conf_mask的shape为:[n], n为置信度大于阈值的box数量
+        conf_mask = (image_pred[:, 4] >= conf_thres).squeeze() # 这里的squeeze()可加可不加
+        image_pred = image_pred[conf_mask] # image_pred的shape为[n, 85]
+
         if not image_pred.size(0):
-            continue
-        # Object confidence times class confidence
-        score = image_pred[:, 4] * image_pred[:, 5:].max(1)[0]
-        # Sort by it
-        image_pred = image_pred[(-score).argsort()]
-        class_confs, class_preds = image_pred[:, 5:].max(1, keepdim=True)
-        detections = torch.cat((image_pred[:, :5], class_confs.float(), class_preds.float()), 1)
-        # Perform non-maximum suppression
-        keep_boxes = []
-        while detections.size(0):
-            large_overlap = bbox_iou(detections[0, :4].unsqueeze(0), detections[:, :4]) > nms_thres
-            label_match = detections[0, -1] == detections[:, -1]
-            # Indices of boxes with lower confidence scores, large IOUs and matching labels
-            invalid = large_overlap & label_match
-            weights = detections[invalid, 4:5]
-            # Merge overlapping bboxes by order of confidence
-            detections[0, :4] = (weights * detections[invalid, :4]).sum(0) / weights.sum()
-            keep_boxes += [detections[0]]
-            detections = detections[~invalid]
-        if keep_boxes:
-            output[image_i] = torch.stack(keep_boxes)
+            continue # 如果所有的box的置信度都小于阈值, 那么就跳过当前的图片, 对下一张进行操作
+
+        # 获取每个box的类别的预测结果和编号(0~79), 使用了keepdim, 否则shape维数会减一(dim指定的维度会消失)
+        # class_conf的shape为[n, 1], 代表n个box的score
+        # class_pred的shape为[n, 1], 代表n个box的类别编号
+        class_conf, class_pred = torch.max(image_pred[:, 5 : 5 + num_classes], 1, keepdim=True)
+
+        # 对以上结果进行汇总, shape为[n,7]: (x1,y1,x2,y2, obj_conf, class_conf, class_pred)
+        detections = torch.cat((image_pred[:, :5], class_conf.float(), class_pred.float()), 1)
+
+        # 获取当前image中出现过的类别号, 然后分别对每一类执行NMS算法
+        unique_labels = detections[:, -1].cpu().unique()
+
+        if prediction.is_cuda:
+            unique_labels = unique_labels.cuda()
+
+        # 分别对每一类执行NMS算法, 注意这点与faster rcnn不同, 后者只对两类执行nms算法, 也就是是否出现物体
+        # faster rcnn的nms算法会有一个问题, 那就是当两个不同物体重复度较高时, fasterrcnn会忽略置信度较低的一个
+        for c in unique_labels:
+            # 获取指定类别的所有box
+            detections_class = detections[detections[:, -1] == c] # detections的最后一维指示类别编号c类的所有detection
+
+            # 按照每个box的置信度进行排序(第5维代表置信度 score)
+            _, conf_sort_index = torch.sort(detections_class[:, 4], descending=True)
+            detections_class = detections_class[conf_sort_index] #对c类的所有从大到小排序
+
+            # 执行NMS算法, 核心思想是先将具有最大socre的box放置在max_detections列表当中,
+            # 然后令该box与剩余的所有同类box计算交并比, 接着删除那些具有较大交并比的box(大于阈值)
+            # 重复对detections_class执行上面两步操作, 知道detections_class中只剩下一个box为止
+            max_detections = []
+            while detections_class.size(0):
+                # 将具有最大score的box添加到max_detections列表中,
+                # 注意要将box的shape扩展成:[1,7], 方便后续max的连接(cat)
+                max_detections.append(detections_class[0].unsqueeze(0))
+
+                # 当只剩下一个box时, 当前类的nms过程终止
+                if len(detections_class) == 1:
+                    break
+
+                # 获取当前最大socre的box与其余同类box的iou, 调用了本文件的bbox_iou()函数     添加merge函数       
+                
+                ious = bbox_iou(max_detections[-1], detections_class[1:])
+                ious.max
+                # 移除那些交并比大于阈值的box(也即只保留交并比小于阈值的box)
+                detections_class = detections_class[1:][ious < nms_thres]
+
+            # 将执行nms后的剩余的同类box连接起来, 最终shape为[m, 7], m为nms后同类box的数量
+            max_detections = torch.cat(max_detections).data
+
+            # 将计算结果添加到output返回值当中, output是一个列表, 列表中的每个元素代表这一张图片的nms后的box
+            # 注意, 此时同一张图片的不同类的box也会连接到一起, box的最后一维会存储类别编号(4+1+1+1).
+            output[image_i] = (
+                max_detections if output[image_i] is None else torch.cat(
+                    (output[image_i], max_detections)
+                )
+            )
 
     return output
-
 
 def build_targets(pred_boxes, pred_cls, target, anchors, ignore_thres):
 
