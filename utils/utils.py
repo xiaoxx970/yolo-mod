@@ -289,7 +289,8 @@ def non_max_suppression(prediction, num_classes, conf_thres=0.5, nms_thres=0.4):
                 # 获取当前最大socre的box与其余同类box的iou, 调用了本文件的bbox_iou()函数     添加merge函数       
                 
                 ious = bbox_iou(max_detections[-1], detections_class[1:])
-                ious.max
+                print(np.shape(ious))
+                print(ious)
                 # 移除那些交并比大于阈值的box(也即只保留交并比小于阈值的box)
                 detections_class = detections_class[1:][ious < nms_thres]
 
